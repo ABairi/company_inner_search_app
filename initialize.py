@@ -121,21 +121,155 @@ def initialize_retriever():
     # 埋め込みモデルの用意
     embeddings = OpenAIEmbeddings()
     
+    # CSVファイルとその他のファイルを分離・統合処理
+    processed_docs = []
+    csv_docs_by_file = {}
+    
+    for doc in docs_all:
+        if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+            file_extension = os.path.splitext(doc.metadata['source'])[1].lower()
+            if file_extension == '.csv':
+                # CSVファイルごとにドキュメントをグループ化
+                file_path = doc.metadata['source']
+                if file_path not in csv_docs_by_file:
+                    csv_docs_by_file[file_path] = []
+                csv_docs_by_file[file_path].append(doc)
+            else:
+                processed_docs.append(doc)
+        else:
+            processed_docs.append(doc)
+    
+    # CSVファイルごとに統合・最適化処理を実行
+    for file_path, csv_docs in csv_docs_by_file.items():
+        enhanced_doc = create_enhanced_csv_document(csv_docs, file_path)
+        processed_docs.append(enhanced_doc)
+    
     # チャンク分割用のオブジェクトを作成
     text_splitter = CharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=ct.CHUNK_SIZE,
+        chunk_overlap=ct.CHUNK_OVERLAP,
         separator="\n"
     )
 
-    # チャンク分割を実施
-    splitted_docs = text_splitter.split_documents(docs_all)
+    # CSVファイル以外のドキュメントのみチャンク分割を実施
+    non_csv_docs = [doc for doc in processed_docs if not (hasattr(doc, 'metadata') and doc.metadata.get('file_type') == 'enhanced_csv')]
+    csv_enhanced_docs = [doc for doc in processed_docs if hasattr(doc, 'metadata') and doc.metadata.get('file_type') == 'enhanced_csv']
+    
+    splitted_docs = text_splitter.split_documents(non_csv_docs)
+    
+    # 統合されたCSVドキュメントは分割せずに追加
+    all_docs = splitted_docs + csv_enhanced_docs
 
     # ベクターストアの作成
-    db = Chroma.from_documents(splitted_docs, embedding=embeddings)
+    db = Chroma.from_documents(all_docs, embedding=embeddings)
 
     # ベクターストアを検索するRetrieverの作成
-    st.session_state.retriever = db.as_retriever(search_kwargs={"k": 3})
+    st.session_state.retriever = db.as_retriever(search_kwargs={"k": ct.RAG_K})
+
+
+def create_enhanced_csv_document(csv_docs, file_path):
+    """
+    CSVドキュメントを統合し、検索精度を向上させる
+    
+    Args:
+        csv_docs: 同一CSVファイルからのドキュメントリスト
+        file_path: CSVファイルのパス
+    
+    Returns:
+        検索最適化されたドキュメント
+    """
+    import copy
+    
+    # 最初のドキュメントをベースに使用
+    base_doc = copy.deepcopy(csv_docs[0])
+    
+    # 全ドキュメントの内容を結合
+    combined_content = ""
+    for doc in csv_docs:
+        combined_content += doc.page_content + "\n"
+    
+    # CSVの内容を解析
+    lines = combined_content.strip().split('\n')
+    if len(lines) < 2:
+        return base_doc
+    
+    # ヘッダー行を取得
+    header_line = lines[0]
+    columns = [col.strip().strip('"') for col in header_line.split(',')]
+    
+    # データ行を取得
+    data_rows = lines[1:]
+    
+    # ファイル情報
+    file_name = os.path.basename(file_path)
+    file_name_without_ext = os.path.splitext(file_name)[0]
+    
+    # 検索最適化されたコンテンツを作成
+    enhanced_content = f"""ファイル名: {file_name}
+データ種別: CSV表形式データ
+総行数: {len(data_rows)}行
+カラム数: {len(columns)}個
+
+=== データ構造 ===
+カラム一覧: {', '.join(columns)}
+
+=== 検索用キーワード ===
+ファイル関連: {file_name_without_ext}, CSV, 表, データ, 一覧
+カラム関連: {', '.join(columns)}
+
+=== データ内容 ===
+"""
+    
+    # 各行のデータを検索しやすい形式に変換
+    all_values = set()
+    for i, row in enumerate(data_rows):
+        cells = [cell.strip().strip('"') for cell in row.split(',')]
+        enhanced_content += f"\n--- 行{i+2} ---\n"
+        
+        # カラム名:値のペア形式で追加
+        for column, cell in zip(columns, cells):
+            if cell:  # 空でない値のみ
+                enhanced_content += f"{column}: {cell}\n"
+                all_values.add(cell)
+        
+        # 行全体を一文でも表現
+        enhanced_content += f"この行の内容: {', '.join([f'{col}は{val}' for col, val in zip(columns, cells) if val])}\n"
+    
+    # 全値をキーワードとして追加
+    unique_values = list(all_values)
+    enhanced_content += f"\n=== データに含まれる全ての値（検索用） ===\n{', '.join(unique_values)}\n"
+    
+    # よくある検索パターンに対応
+    enhanced_content += f"\n=== 検索パターン対応 ===\n"
+    enhanced_content += f"このファイルには以下の情報が含まれています:\n"
+    for column in columns:
+        column_values = []
+        for row in data_rows:
+            cells = [cell.strip().strip('"') for cell in row.split(',')]
+            if len(cells) > columns.index(column):
+                val = cells[columns.index(column)]
+                if val and val not in column_values:
+                    column_values.append(val)
+        if column_values:
+            enhanced_content += f"- {column}: {', '.join(column_values[:10])}{'...' if len(column_values) > 10 else ''}\n"
+    
+    # 統計情報
+    enhanced_content += f"\n=== 統計情報 ===\n"
+    enhanced_content += f"データ行数: {len(data_rows)}行\n"
+    enhanced_content += f"項目数: {len(columns)}項目\n"
+    
+    # 元のCSVデータも保持
+    enhanced_content += f"\n=== 元データ ===\n{combined_content}"
+    
+    # ドキュメントを更新
+    base_doc.page_content = enhanced_content
+    base_doc.metadata['file_type'] = 'enhanced_csv'
+    base_doc.metadata['columns'] = ', '.join(columns)
+    base_doc.metadata['row_count'] = len(data_rows)
+    base_doc.metadata['all_values'] = ', '.join(unique_values)
+    base_doc.metadata['keywords'] = f"{file_name_without_ext}, {', '.join(columns)}, {', '.join(unique_values[:50])}"
+    
+    return base_doc
 
 
 def initialize_session_state():
